@@ -50,7 +50,7 @@ It is general and adapted to SD v1.5, but should be easily adaptable to other mo
 ## Setup 🚀
 
 ```bash
-conda create -n sae-diff-autointerpr python=3.10
+conda create -n sae-diff-autointerpr python=`cat .python-version` -y
 conda activate sae-diff-autointerpr
 pip install -r requirements.txt
 ```
