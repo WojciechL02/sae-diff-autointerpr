@@ -1,0 +1,1 @@
+squeue -A plgzzsn2025-gpu-a100 | awk 'NR>1 {users[$4]++} END {for (user in users) print user, users[user]}'
