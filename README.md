@@ -46,8 +46,12 @@ Basically 3 steps:
 
 It is general and adapted to SD v1.5, but should be easily adaptable to other models.
 
-
 ## Setup 🚀
+
+```bash
+cp user.env .env
+vim .env
+```
 
 ```bash
 conda create -n sae-diff-autointerpr python=`cat .python-version` -y
