@@ -141,6 +141,7 @@ class CacheActivationsRunnerConfig:
 @dataclass
 class CacheActivationsImagesRunnerConfig:
     dataset_path: str
+    split: str = "train"
     hook_names: list[str] | None = None
     new_cached_activations_path: str | None = None
     device: torch.device | str = "cuda"

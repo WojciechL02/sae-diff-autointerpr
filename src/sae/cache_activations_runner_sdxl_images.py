@@ -86,9 +86,9 @@ class CacheActivationsRunner:
             ds_hf = ds_hf.shuffle(self.cfg.seed)
             paths = [
                 os.path.join(self.cfg.dataset_path, example["file_name"])
-                for example in ds_hf["train"]
+                for example in ds_hf[cfg.split]
             ]
-            self.file_names = [example["file_name"] for example in ds_hf["train"]]
+            self.file_names = [example["file_name"] for example in ds_hf[cfg.split]]
             self.dataset = ImageDataset(paths, self.cfg.height)
             if limit := self.cfg.max_num_examples:
                 self.dataset = torch.utils.data.Subset(self.dataset, range(limit))
