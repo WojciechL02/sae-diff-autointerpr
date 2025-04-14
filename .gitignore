@@ -1,5 +1,8 @@
 data/
 checkpoints/
+figures/
+logs/
+activations/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
