@@ -17,7 +17,9 @@ from src.vocab import get_vocabulary
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Retrive the most similar concept based on the PCA direction of the captions")
+    parser = argparse.ArgumentParser(
+        description="Retrive the most similar concepts based on the 1st PCA direction of captions retrived from the topk activating examples"
+    )
     parser.add_argument("--sae_ckpt_path", type=str, required=True, help="Path to the SAE checkpoint")
     parser.add_argument("--sae_hookpoint", type=str, required=True, help="Hookpoint to use for the SAE")
     parser.add_argument(
@@ -30,10 +32,10 @@ def parse_args():
     parser.add_argument(
         "--output_dir", type=str, default="pcaed_captions_matching", help="Directory to save the output images"
     )
-    parser.add_argument('--vocab_name', type=str, default="laion", help="Vocabulary name")
-    parser.add_argument('--vocab_size', type=int, default=-1, help="Vocabulary size")
-    parser.add_argument('--concept_embeddings_path', type=str, default=None, help="Path to the concept embeddings")
-    parser.add_argument('--topk_concepts', type=int, default=5, help="Number of top concepts to retrieve")
+    parser.add_argument("--vocab_name", type=str, default="laion", help="Vocabulary name")
+    parser.add_argument("--vocab_size", type=int, default=-1, help="Vocabulary size")
+    parser.add_argument("--concept_embeddings_path", type=str, default=None, help="Path to the concept embeddings")
+    parser.add_argument("--topk_concepts", type=int, default=5, help="Number of top concepts to retrieve")
     return parser.parse_args()
 
 
@@ -60,7 +62,7 @@ def run(args):
         else args.concept_embeddings_path
     )
 
-    def get_concept_embeddings(text_encoder, vocab: list[str], device = "cuda"):
+    def get_concept_embeddings(text_encoder, vocab: list[str], device="cuda"):
         concepts = []
 
         for concept in tqdm(vocab, desc="Getting concept embeddings", total=len(vocab)):
@@ -79,7 +81,7 @@ def run(args):
         concept_embeddings = torch.load(concept_embeddings_path, map_location="cpu").to(device)
     else:
         concept_embeddings = get_concept_embeddings(text_encoder, vocab, device=device)
-        torch.save(concept_embeddings.cpu(), concept_embeddings_path) 
+        torch.save(concept_embeddings.cpu(), concept_embeddings_path)
         print(f"Saved concept embeddings to {concept_embeddings_path}")
 
     print(f"Concept embeddings shape: {concept_embeddings.shape}")
@@ -125,19 +127,16 @@ def run(args):
             avg_activations_per_sample[start_idx:end_idx] = batch_avg_activations
 
     def find_topk_activating_examples(activations_per_sample, latent_idx, k=10):
-        topk_indices = torch.argsort(
-            activations_per_sample[:, latent_idx], dim=0, descending=True
-        )[:k]
+        topk_indices = torch.argsort(activations_per_sample[:, latent_idx], dim=0, descending=True)[:k]
         return topk_indices
 
     coco_dataset = load_dataset("phiyodr/coco2017")
-
 
     with open(os.path.join(args.output_dir, "concepts.tsv"), "w") as f:
         for latent_idx in trange(sae.num_latents, desc="Matching captions for latent neurons"):
             if latent_idx == 0:
                 f.write("latent_idx\tconcepts\n")
-            
+
             topk_indices = find_topk_activating_examples(
                 avg_activations_per_sample, latent_idx, args.topk_examples
             )  # find topk samples containing patches with higest activations
@@ -145,11 +144,9 @@ def run(args):
             file_names_topk = topk_samples["file_name"]
 
             # filter coco dataset to only include the topk samples
-            coco_topk_samples = coco_dataset["validation"].filter(
-                lambda x: x["file_name"] in file_names_topk
-            )
+            coco_topk_samples = coco_dataset["validation"].filter(lambda x: x["file_name"] in file_names_topk)
             # concatenate all caption for each image
-            topk_samples_captions = [" ".join(captions) for captions in coco_topk_samples['captions']]
+            topk_samples_captions = [" ".join(captions) for captions in coco_topk_samples["captions"]]
 
             # get text embeddings for topk samples captions
             prompt_embeds, _, pooled_prompt_embeds, _ = text_encoder(topk_samples_captions, device=device)
@@ -157,13 +154,15 @@ def run(args):
 
             # perform PCA on the text embeddings and extract the first PC direction
             pca = PCA(n_components=1).to(topk_samples_caption_embeddings.device).fit(topk_samples_caption_embeddings.float())
-            pca_captions_embedding = (pca.components_.sum(dim=1,keepdim=True) + pca.mean_).mean(1)
+            pca_captions_embedding = (pca.components_.sum(dim=1, keepdim=True) + pca.mean_).mean(1)
 
-            similarities = F.cosine_similarity(pca_captions_embedding.expand_as(concept_embeddings), concept_embeddings, dim=1)
-            most_similar_indices = torch.argsort(similarities, descending=True)[:args.topk_concepts]
+            similarities = F.cosine_similarity(
+                pca_captions_embedding.expand_as(concept_embeddings), concept_embeddings, dim=1
+            )
+            most_similar_indices = torch.argsort(similarities, descending=True)[: args.topk_concepts]
             most_similar_indices = most_similar_indices.cpu().numpy()
             most_similar_concepts = [vocab[i] for i in most_similar_indices]
-            
+
             if latent_idx % 100 == 0:
                 print(f"Latent {latent_idx}: {', '.join(most_similar_concepts)}")
 
@@ -172,4 +171,4 @@ def run(args):
 
 
 if __name__ == "__main__":
-	run(parse_args())
+    run(parse_args())
