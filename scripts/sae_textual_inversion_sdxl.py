@@ -15,14 +15,18 @@
 # From: https://github.com/huggingface/diffusers/blob/main/examples/textual_inversion/textual_inversion_sdxl.py
 
 import argparse
+import gc
 import logging
 import math
 import os
 import random
 import shutil
+import sys
 from pathlib import Path
+from typing import Dict, List
 
 import diffusers
+import einops
 import numpy as np
 import PIL
 import safetensors
@@ -33,12 +37,16 @@ import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
-from diffusers import (AutoencoderKL, DDPMScheduler, DiffusionPipeline,
-                       DPMSolverMultistepScheduler, UNet2DConditionModel)
+from diffusers import (
+    AutoencoderKL,
+    DDPMScheduler,
+    DiffusionPipeline,
+    DPMSolverMultistepScheduler,
+    UNet2DConditionModel,
+)
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
-from diffusers.utils.hub_utils import (load_or_create_model_card,
-                                       populate_model_card)
+from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 from diffusers.utils.import_utils import is_xformers_available
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
@@ -46,8 +54,12 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 from tqdm.auto import tqdm
-from transformers import (CLIPTextModel, CLIPTextModelWithProjection,
-                          CLIPTokenizer)
+from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
+
+sys.path.append(os.path.dirname(__file__))
+
+from src.hooked_model.utils import locate_block, retrieve
+from src.sae.sae import Sae
 
 if is_wandb_available():
     import wandb
@@ -128,7 +140,7 @@ def log_validation(
         f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
         f" {args.validation_prompt}."
     )
-    pipeline = DiffusionPipeline.from_pretrained(  # TODO: why not StableDiffusionXLPipeline?
+    pipeline = DiffusionPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         text_encoder=accelerator.unwrap_model(text_encoder_1),
         text_encoder_2=accelerator.unwrap_model(text_encoder_2),
@@ -186,6 +198,108 @@ def save_progress(text_encoder, placeholder_token_ids, accelerator, args, save_p
         torch.save(learned_embeds_dict, save_path)
 
 
+def find_topk_activating_examples(activations_per_sample, latent_idx, k=10):
+    topk_indices = torch.argsort(activations_per_sample[:, latent_idx], dim=0, descending=True)[:k]
+    return topk_indices
+
+
+def flush():
+    torch.cuda.empty_cache()
+    gc.collect()
+
+
+def run_with_cache(
+    unet: torch.nn.Module,
+    noisy_latents: torch.Tensor,
+    timestep: torch.Tensor,
+    encoder_hidden_states: torch.Tensor,
+    positions_to_cache: List[str],
+    save_input: bool = False,
+    save_output: bool = True,
+    **kwargs,
+):
+    """
+    Run UNet while caching intermediate values at specified positions.
+    Returns both the final image and a dictionary of cached values.
+    """
+    cache_input, cache_output = (
+        dict() if save_input else None,
+        dict() if save_output else None,
+    )
+    hooks = [
+        _register_cache_hook(
+            position,
+            cache_input,
+            cache_output,
+        )
+        for position in positions_to_cache
+    ]
+    hooks = [hook for hook in hooks if hook is not None]
+
+    image = unet(
+        noisy_latents,
+        timestep,
+        encoder_hidden_states,
+        **kwargs,
+    ).sample
+
+    # Stack cached tensors along time dimension
+    cache_dict = {}
+    if save_input:
+        for position, block in cache_input.items():
+            cache_input[position] = torch.stack(block, dim=1)
+        cache_dict["input"] = cache_input
+
+    if save_output:
+        for position, block in cache_output.items():
+            cache_output[position] = torch.stack(block, dim=1)
+        cache_dict["output"] = cache_output
+
+    for hook in hooks:
+        hook.remove()
+
+    return image, cache_dict
+
+
+def _register_cache_hook(
+    model: torch.nn.Module,
+    position: str,
+    cache_input: Dict,
+    cache_output: Dict,
+    unconditional: bool = False,
+    pool: bool = False,
+    do_classifier_free_guidance: bool = False,
+):
+    block = locate_block(position, model)
+
+    def hook(module, input, kwargs, output):
+        if cache_input is not None:
+            if position not in cache_input:
+                cache_input[position] = []
+            input_to_cache = retrieve(input, unconditional, do_classifier_free_guidance)
+            if len(input_to_cache.shape) == 4:
+                input_to_cache = input_to_cache.view(input_to_cache.shape[0], input_to_cache.shape[1], -1).permute(
+                    0, 2, 1
+                )
+            if pool:
+                input_to_cache = input_to_cache.mean(dim=1, keepdim=True)
+            cache_input[position].append(input_to_cache)
+
+        if cache_output is not None:
+            if position not in cache_output:
+                cache_output[position] = []
+            output_to_cache = retrieve(output, unconditional, do_classifier_free_guidance)
+            if len(output_to_cache.shape) == 4:
+                output_to_cache = output_to_cache.view(output_to_cache.shape[0], output_to_cache.shape[1], -1).permute(
+                    0, 2, 1
+                )
+            if pool:
+                output_to_cache = output_to_cache.mean(dim=1, keepdim=True)
+            cache_output[position].append(output_to_cache)
+
+    return block.register_forward_hook(hook, with_kwargs=True)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser.add_argument(
@@ -224,9 +338,6 @@ def parse_args():
         type=str,
         default=None,
         help="Variant of the model files of the pretrained model identifier from huggingface.co/models, 'e.g.' fp16",
-    )
-    parser.add_argument(
-        "--train_data_dir", type=str, default=None, required=True, help="A folder containing the training data."
     )
     parser.add_argument(
         "--placeholder_token",
@@ -420,19 +531,79 @@ def parse_args():
     parser.add_argument(
         "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
     )
-
+    parser.add_argument(
+        "--sae_checkpoint_path",
+        type=str,
+        required=True,
+        help="Path to the checkpoint of the SAE model.",
+    )
+    parser.add_argument(
+        "--sae_hookpoint",
+        type=str,
+        required=True,
+        help=(
+            "UNet block name to register the forward hook for the SAE latents e.g. down_blocks.2."
+        ),
+    )
+    parser.add_argument(
+        "--sae_latent_idx",
+        type=int,
+        default=0,
+        help=(
+            "SAE latent index to perform the textual inversion on."
+        ),
+    )
+    parser.add_argument(
+        "--cached_activations_path",
+        type=str,
+        required=True,
+        help=(
+            "Path to the cached UNet activations at `sae_hookpoint`. The activations are used to retrieve samples used for textual inversion."
+        ),
+    )
+    parser.add_argument(
+        "--coco_dataset_path",
+        type=str,
+        required=True,
+        help=(
+            "Path to the COCO dataset. The dataset is used to retrieve samples used for textual inversion."
+        ),
+    )
+    parser.add_argument(
+        "--topk_examples",
+        type=int,
+        default=5,
+        help=(
+            "Number of examples that activate `sae_latent_idx` the most, as well as the number of examples used for textual inversion.."
+        )
+    )
+    parser.add_argument(
+        "--timestep",
+        type=int,
+        default=249,
+        help="Diffusion timestep used for SAE activations.",
+    )
+    parser.add_argument(
+        "--sae_activation_loss",
+        type=str,
+        default="l2",
+        help="Regularization loss used to enforce maximization of SAE activations at `sae_latent_idx`.",
+    )
+    parser.add_argument(
+        "--sae_activation_loss_weight",
+        type=float,
+        default=1.0,
+        help="Regulariazation strength for the SAE activation loss.",
+    )
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
 
-    if args.train_data_dir is None:
-        raise ValueError("You must specify a train data directory.")
-
     return args
 
 
-imagenet_templates_small = [  # TODO: change templates e.g. 'a photo containing a concept of a {}'
+imagenet_templates_small = [
     "a photo of a {}",
     "a rendering of a {}",
     "a cropped photo of the {}",
@@ -484,8 +655,20 @@ imagenet_style_templates_small = [
     "a large painting in the style of {}",
 ]
 
-# TODO: retrieve topk_examples from the SAE, save image_paths
-class TextualInversionDataset(Dataset):
+# TODO: improve templates e.g. 'a photo containing a concept of a {}'
+sae_concept_templates_small = [
+    "an image where {} is visible",
+    "a photo containing a concept of a {}",
+    "a scene with a visual concept of {}",
+    "a rendering that includes the concept of a {}",
+    "a composition with a strong presence of {}",
+    "an image featuring {}-like visual elements",
+    "a photo where the {} concept is present",
+    "a surface with a concept of {} texture",
+    "an artwork inspired by the concept of a {}"
+]
+
+class SAETextualInversionDataset(Dataset):
     def __init__(
         self,
         data_root,
@@ -499,6 +682,7 @@ class TextualInversionDataset(Dataset):
         set="train",
         placeholder_token="*",
         center_crop=False,
+        file_names=None,
     ):
         self.data_root = data_root
         self.tokenizer_1 = tokenizer_1
@@ -509,7 +693,10 @@ class TextualInversionDataset(Dataset):
         self.center_crop = center_crop
         self.flip_p = flip_p
 
-        self.image_paths = [os.path.join(self.data_root, file_path) for file_path in os.listdir(self.data_root)]
+        if file_names is not None:
+            self.image_paths = [os.path.join(self.data_root, file_name) for file_name in file_names]
+        else:
+            self.image_paths = [os.path.join(self.data_root, file_name) for file_name in os.listdir(self.data_root)]
 
         self.num_images = len(self.image_paths)
         self._length = self.num_images
@@ -524,7 +711,11 @@ class TextualInversionDataset(Dataset):
             "lanczos": PIL_INTERPOLATION["lanczos"],
         }[interpolation]
 
-        self.templates = imagenet_style_templates_small if learnable_property == "style" else imagenet_templates_small
+        self.templates = {
+            "object": imagenet_templates_small,
+            "style": imagenet_style_templates_small,
+            "concept": sae_concept_templates_small,
+        }[learnable_property]
         self.flip_transform = transforms.RandomHorizontalFlip(p=self.flip_p)
         self.crop = transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size)
 
@@ -533,6 +724,7 @@ class TextualInversionDataset(Dataset):
 
     def __getitem__(self, i):
         example = {}
+        example["image_id"] = i % self.num_images
         image = Image.open(self.image_paths[i % self.num_images])
 
         if not image.mode == "RGB":
@@ -637,13 +829,25 @@ def main():
                 repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
             ).repo_id
 
+    # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
+    # as these weights are only used for inference, keeping weights in full precision is not required.
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+
+    # Load SAE
+    sae = Sae.load_from_disk(os.path.join(args.sae_checkpoint_path, args.sae_hookpoint))
+    sae.requires_grad_(False)
+    sae.to(accelerator.device, dtype=weight_dtype)
+
     # Load tokenizer
     tokenizer_1 = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
     tokenizer_2 = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer_2")
 
     # Load scheduler and models
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-    # TODO: noise_scheduler.set_timesteps(args.num_inference_steps) -- same as for sae
     text_encoder_1 = CLIPTextModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
     )
@@ -656,7 +860,6 @@ def main():
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
     )
-    # TODO: add sae to unet
 
     # Add the placeholder token in tokenizer_1
     placeholder_tokens = [args.placeholder_token]
@@ -712,7 +915,6 @@ def main():
     # Freeze vae and unet
     vae.requires_grad_(False)
     unet.requires_grad_(False)
-    # TODO: freeze sae params
 
     # Freeze all parameters except for the token embeddings in text encoder
     text_encoder_1.text_model.encoder.requires_grad_(False)
@@ -775,10 +977,63 @@ def main():
     )
 
     placeholder_token = " ".join(tokenizer_1.convert_ids_to_tokens(placeholder_token_ids))
+
+    # Load cached activations dataset
+    cached_activations_dataset = Dataset.load_from_disk(
+        os.path.join(args.cached_activations_path, args.sae_hookpoint), keep_in_memory=False
+    )
+    cached_activations_dataset.set_format(type="torch", columns=["activations", "timestep", "file_name"], dtype=sae.dtype)
+    cached_activations_dataset = cached_activations_dataset.filter(lambda x: x["timestep"] == args.timestep, batched=True)
+
+    # Retrieve most activating examples
+    avg_activations_per_sample = torch.zeros((len(cached_activations_dataset), sae.num_latents), dtype=sae.dtype)
+    batch_size = 64
+    cached_activations_dataloader = torch.utils.data.DataLoader(cached_activations_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    with torch.no_grad():
+        for i, batch in tqdm(enumerate(cached_activations_dataloader), total=len(cached_activations_dataloader), desc="Retriving max activating examples"):
+            acts = batch["activations"].to(sae.device)
+            acts = einops.rearrange(
+                acts,
+                "batch sample_size d_model -> (batch sample_size) d_model",
+            )
+            out = sae.pre_acts(acts)
+            # Reshape to get per-sample activations and compute mean for each sample
+            out = out.view(batch["activations"].shape[0], -1, sae.num_latents)  # [batch, sample_size, num_latents]
+            batch_avg_activations = out.mean(dim=1).to(dtype=sae.dtype)  # [batch, num_latents]
+
+            # Store in the correct indices
+            start_idx = i * batch_size
+            end_idx = min(start_idx + batch_size, len(cached_activations_dataset))
+            avg_activations_per_sample[start_idx:end_idx] = batch_avg_activations
+
+    topk_indices = find_topk_activating_examples(
+        avg_activations_per_sample, args.sae_latent_idx, k=args.topk_examples
+    )
+    topk_examples = cached_activations_dataset[topk_indices.tolist()]
+    topk_examples_file_names = topk_examples["file_name"]
+    
+    del cached_activations_dataset, cached_activations_dataloader
+    flush()
+
+    with torch.no_grad():
+        topk_activations = topk_examples["activations"].to(sae.device)
+        topk_activations = einops.rearrange(
+            topk_activations,
+            "batch sample_size d_model -> (batch sample_size) d_model",
+        )
+        topk_sae_latents = sae.pre_acts(topk_activations)
+        topk_sae_latents = topk_sae_latents.view(args.topk_examples, -1, sae.num_latents)
+        topk_active_positions_mask = topk_sae_latents[:, :, args.sae_latent_idx] > 0.0
+        topk_active_positions_mask = topk_active_positions_mask.float().cpu()
+
+        del topk_activations, topk_sae_latents
+        flush()
+
+
     # Dataset and DataLoaders creation:
-    # TODO: retrieve image paths in coco for topk_examples
-    train_dataset = TextualInversionDataset(
-        data_root=args.train_data_dir,
+    train_dataset = SAETextualInversionDataset(
+        data_root=args.coco_dataset_path,
+        file_names=topk_examples_file_names,
         tokenizer_1=tokenizer_1,
         tokenizer_2=tokenizer_2,
         size=args.resolution,
@@ -814,20 +1069,10 @@ def main():
         text_encoder_1, text_encoder_2, optimizer, train_dataloader, lr_scheduler
     )
 
-    # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
-    # as these weights are only used for inference, keeping weights in full precision is not required.
-    weight_dtype = torch.float32
-    if accelerator.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-    elif accelerator.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
-
     # Move vae and unet and text_encoder_2 to device and cast to weight_dtype
     unet.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
     text_encoder_2.to(accelerator.device, dtype=weight_dtype)
-
-    # TODO: register forward hook for sae latents
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -906,8 +1151,9 @@ def main():
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
                 # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-                timesteps = timesteps.long()
+                # timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+                # timesteps = timesteps.long()
+                timesteps = torch.full((bsz,), args.timestep, device=latents.device, dtype=torch.long)
 
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
@@ -939,10 +1185,15 @@ def main():
                 added_cond_kwargs = {"text_embeds": encoder_output_2[0], "time_ids": add_time_ids}
                 encoder_hidden_states = torch.cat([encoder_hidden_states_1, encoder_hidden_states_2], dim=-1)
 
-                # Predict the noise residual
-                model_pred = unet(
-                    noisy_latents, timesteps, encoder_hidden_states, added_cond_kwargs=added_cond_kwargs
-                ).sample
+                # Predict the noise residual and cache intermediate activations
+                model_pred, acts_cache = run_with_cache(
+                    unet,
+                    noisy_latents,
+                    timesteps,
+                    encoder_hidden_states,
+                    positions_to_cache=[args.sae_hookpoint],
+                    added_cond_kwargs=added_cond_kwargs,
+                )
 
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":
@@ -952,9 +1203,31 @@ def main():
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                # TODO: add sae regularization loss: negative sum of squared latent_idx activations (l2 loss) or margin-based loss sum_j max(0, m - (z_i - z_j))
+                diffusion_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                
+                # Compute SAE latent activations
+                acts = acts_cache["output"][args.hookpoint]
+                print(acts.shape)
+                acts = einops.rearrange(
+                    acts,
+                    "batch sample_size d_model -> (batch sample_size) d_model",
+                )
+                sae_latent_acts = sae.pre_acts(acts)
+                sae_latent_acts = sae_latent_acts.view(bsz, -1, sae.num_latents)
 
+                # Mask out positions without concept
+                active_positions_mask = topk_active_positions_mask[batch["image_id"]].to(sae.device)
+                sae_latent_acts = sae_latent_acts * active_positions_mask[:, :, None]
+
+                # Compute the SAE activation loss
+                if args.sae_activation_loss == "l2":
+                    sae_loss = -torch.mean(sae_latent_acts[:, :, args.sae_latent_idx] ** 2)
+                elif args.sae_activation_loss == "l1":
+                    sae_loss = -torch.mean(sae_latent_acts[:, :, args.sae_latent_idx].abs())
+                else:
+                    raise ValueError(f"Unknown SAE activation loss {args.sae_activation_loss}")
+
+                loss = diffusion_loss + args.sae_activation_loss_weight * sae_loss
                 accelerator.backward(loss)
 
                 optimizer.step()
@@ -1042,7 +1315,7 @@ def main():
                             epoch,
                         )
 
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"diffusion_loss": diffusion_loss.detach().item(), "sae_loss": sae_loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
