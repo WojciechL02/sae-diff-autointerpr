@@ -20,7 +20,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Retrive the most similar concepts based on the 1st PCA direction of captions retrived from the topk activating examples"
     )
-    parser.add_argument("--sae_ckpt_path", type=str, required=True, help="Path to the SAE checkpoint")
+    parser.add_argument("--sae_checkpoint_path", type=str, required=True, help="Path to the SAE checkpoint")
     parser.add_argument("--sae_hookpoint", type=str, required=True, help="Hookpoint to use for the SAE")
     parser.add_argument(
         "--cached_activations_path", type=str, required=True, help="Path to the cached activations dataset"
@@ -89,7 +89,7 @@ def run(args):
     # load SAE
     sae = Sae.load_from_disk(
         os.path.join(
-            args.sae_ckpt_path,
+            args.sae_checkpoint_path,
             args.sae_hookpoint,
         ),
         device=device,

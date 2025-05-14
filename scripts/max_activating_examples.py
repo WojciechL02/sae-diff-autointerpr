@@ -29,7 +29,7 @@ plt.rc("figure", titlesize=BIGGER_SIZE, labelsize=SMALL_SIZE)  # f
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Find and visualize max activating examples for each SAE neuron")
-    parser.add_argument("--sae_ckpt_path", type=str, required=True, help="Path to the SAE checkpoint")
+    parser.add_argument("--sae_checkpoint_path", type=str, required=True, help="Path to the SAE checkpoint")
     parser.add_argument("--sae_hookpoint", type=str, required=True, help="Hookpoint to use for the SAE")
     parser.add_argument(
         "--cached_activations_path", type=str, required=True, help="Path to the cached activations dataset"
@@ -51,7 +51,7 @@ def run(args):
 
     sae = Sae.load_from_disk(
         os.path.join(
-            args.sae_ckpt_path,
+            args.sae_checkpoint_path,
             args.sae_hookpoint,
         ),
         device=device,
