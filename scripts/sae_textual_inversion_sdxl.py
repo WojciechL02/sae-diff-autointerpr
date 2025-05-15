@@ -37,6 +37,7 @@ import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
+from datasets import Dataset
 from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
@@ -51,7 +52,6 @@ from diffusers.utils.import_utils import is_xformers_available
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from PIL import Image
-from torch.utils.data import Dataset
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
@@ -84,7 +84,7 @@ else:
 
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
-check_min_version("0.34.0.dev0")
+# check_min_version("0.34.0.dev0")
 
 logger = get_logger(__name__)
 
@@ -211,7 +211,7 @@ def flush():
 def run_with_cache(
     unet: torch.nn.Module,
     noisy_latents: torch.Tensor,
-    timestep: torch.Tensor,
+    timesteps: torch.Tensor,
     encoder_hidden_states: torch.Tensor,
     positions_to_cache: List[str],
     save_input: bool = False,
@@ -228,6 +228,7 @@ def run_with_cache(
     )
     hooks = [
         _register_cache_hook(
+            unet,
             position,
             cache_input,
             cache_output,
@@ -238,7 +239,7 @@ def run_with_cache(
 
     image = unet(
         noisy_latents,
-        timestep,
+        timesteps,
         encoder_hidden_states,
         **kwargs,
     ).sample
@@ -668,7 +669,7 @@ sae_concept_templates_small = [
     "an artwork inspired by the concept of a {}"
 ]
 
-class SAETextualInversionDataset(Dataset):
+class SAETextualInversionDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         data_root,
@@ -1024,7 +1025,7 @@ def main():
         topk_sae_latents = sae.pre_acts(topk_activations)
         topk_sae_latents = topk_sae_latents.view(args.topk_examples, -1, sae.num_latents)
         topk_active_positions_mask = topk_sae_latents[:, :, args.sae_latent_idx] > 0.0
-        topk_active_positions_mask = topk_active_positions_mask.float().cpu()
+        topk_active_positions_mask = topk_active_positions_mask.float()
 
         del topk_activations, topk_sae_latents
         flush()
@@ -1084,8 +1085,13 @@ def main():
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        accelerator.init_trackers("textual_inversion", config=vars(args))
+        accelerator.init_trackers(os.getenv("WANDB_PROJECT", "textual_inversion"), config=vars(args))
 
+        # Save arguments to a file
+        save_path = os.path.join(args.output_dir, "config.json")
+        with open(save_path, "w") as f:
+            json.dump(vars(args), f, indent=4)
+        
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
@@ -1206,24 +1212,24 @@ def main():
                 diffusion_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
                 
                 # Compute SAE latent activations
-                acts = acts_cache["output"][args.hookpoint]
-                print(acts.shape)
+                acts = acts_cache["output"][args.sae_hookpoint]  # (batch_size, num_timesteps, sample_size, d_model)
+                acts = acts.squeeze(1)  # NOTE: only one timestep is used
                 acts = einops.rearrange(
                     acts,
-                    "batch sample_size d_model -> (batch sample_size) d_model",
+                    "batch_size sample_size d_model -> (batch_size sample_size) d_model",
                 )
                 sae_latent_acts = sae.pre_acts(acts)
                 sae_latent_acts = sae_latent_acts.view(bsz, -1, sae.num_latents)
 
                 # Mask out positions without concept
-                active_positions_mask = topk_active_positions_mask[batch["image_id"]].to(sae.device)
-                sae_latent_acts = sae_latent_acts * active_positions_mask[:, :, None]
+                active_positions_mask = topk_active_positions_mask[batch["image_id"]]
+                sae_latent_acts = active_positions_mask * sae_latent_acts[:, :, args.sae_latent_idx]
 
                 # Compute the SAE activation loss
                 if args.sae_activation_loss == "l2":
-                    sae_loss = -torch.mean(sae_latent_acts[:, :, args.sae_latent_idx] ** 2)
+                    sae_loss = -torch.mean(sae_latent_acts ** 2)
                 elif args.sae_activation_loss == "l1":
-                    sae_loss = -torch.mean(sae_latent_acts[:, :, args.sae_latent_idx].abs())
+                    sae_loss = -torch.mean(sae_latent_acts.abs())
                 else:
                     raise ValueError(f"Unknown SAE activation loss {args.sae_activation_loss}")
 
