@@ -678,6 +678,12 @@ def parse_args():
         default=1.0,
         help="Regulariazation strength for the SAE activation loss.",
     )
+    parser.add_argument(
+        "--sae_max_feature_act",
+        type=float,
+        required=True,
+        help="Maximal activation value that learned feature can have.",
+    )
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -1417,7 +1423,10 @@ def main():
                 sae_latent_acts_org = (
                     active_positions_mask.unsqueeze(-1) * sae_latent_acts_org
                 )
-                sae_latent_acts = sae_latent_acts_org[:, :, args.sae_latent_idx]
+                sae_latent_acts = torch.clamp(
+                    sae_latent_acts_org[:, :, args.sae_latent_idx],
+                    max=args.sae_max_feature_act,
+                )
 
                 other_features_indices = [
                     i for i in range(sae.num_latents) if i != args.sae_latent_idx
