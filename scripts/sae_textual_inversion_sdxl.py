@@ -202,6 +202,8 @@ def save_progress(
     args,
     save_path,
     safe_serialization=True,
+    tokenizer=None,
+    step=None,
 ):
     logger.info("Saving embeddings")
     learned_embeds = (
@@ -210,6 +212,26 @@ def save_progress(
         .weight[min(placeholder_token_ids) : max(placeholder_token_ids) + 1]
     )
     learned_embeds_dict = {args.placeholder_token: learned_embeds.detach().cpu()}
+
+    if tokenizer is not None:
+        other_ids = [i for i in range(len(tokenizer)) if i != placeholder_token_ids]
+        embeddings = (
+            accelerator.unwrap_model(text_encoder)
+            .get_input_embeddings()
+            .weight[other_ids]
+        )
+        tokens, scores = get_most_similar_tokens(
+            learned_embeds.detach(), embeddings.detach(), tokenizer, k=8
+        )
+        table = wandb.Table(columns=["token", "cosine_similarity"])
+        for tok, score in zip(tokens, scores):
+            table.add_data(tok, score)
+
+        table = {f"top_tokens_table_{step}": table}
+        accelerator.log(table, step=step)
+        accelerator.log(
+            {"max_token_cos_sim": scores[1]}
+        )  # first is just a learned token
 
     if safe_serialization:
         safetensors.torch.save_file(
@@ -679,6 +701,12 @@ def parse_args():
         help="Regulariazation strength for the SAE activation loss.",
     )
     parser.add_argument(
+        "--diffusion_loss_weight",
+        type=float,
+        default=1.0,
+        help="Weight for the diffusion loss term.",
+    )
+    parser.add_argument(
         "--sae_max_feature_act",
         type=float,
         required=True,
@@ -809,7 +837,7 @@ class SAETextualInversionDataset(torch.utils.data.Dataset):
         self.templates = {
             "object": imagenet_templates_small,
             "style": imagenet_style_templates_small,
-            "concept": sae_concept_templates_small,
+            "concept": imagenet_templates_small,
         }[learnable_property]
         self.flip_transform = transforms.RandomHorizontalFlip(p=self.flip_p)
         self.crop = (
@@ -871,6 +899,15 @@ class SAETextualInversionDataset(torch.utils.data.Dataset):
 
         example["pixel_values"] = torch.from_numpy(image).permute(2, 0, 1)
         return example
+
+
+def get_most_similar_tokens(learned_embeds, embeddings, tokenizer, k=8):
+    learned_embeds = F.normalize(learned_embeds, dim=1)
+    embeddings = F.normalize(embeddings, dim=1)
+    similarities = torch.matmul(embeddings, learned_embeds.T)
+    values, indices = similarities.topk(k=k, dim=0)
+    tokens = tokenizer.convert_ids_to_tokens(indices.T.squeeze())
+    return tokens, values
 
 
 def main():
@@ -1447,7 +1484,10 @@ def main():
                         f"Unknown SAE activation loss {args.sae_activation_loss}"
                     )
 
-                loss = diffusion_loss + args.sae_activation_loss_weight * sae_loss
+                loss = (
+                    args.diffusion_loss_weight * diffusion_loss
+                    + args.sae_activation_loss_weight * sae_loss
+                )
                 accelerator.backward(loss)
 
                 optimizer.step()
@@ -1494,7 +1534,9 @@ def main():
                         accelerator,
                         args,
                         save_path,
-                        safe_serialization=True,
+                        True,
+                        tokenizer_1,
+                        global_step,
                     )
                     weight_name = f"learned_embeds_2-steps-{global_step}.safetensors"
                     save_path = os.path.join(args.output_dir, weight_name)
