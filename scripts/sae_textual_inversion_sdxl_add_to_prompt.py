@@ -688,7 +688,7 @@ class SAETextualInversionDataset(torch.utils.data.Dataset):
             for name in self.image_paths
         ]
         
-        with open(os.path.join("annotations/captions_val2017.json"), "r") as f:
+        with open(os.path.join(self.data_root, "annotations/captions_val2017.json"), "r") as f:
             captions = json.load(f)
 
         id_to_captions = defaultdict(list)
@@ -869,11 +869,12 @@ def main():
     )
 
     # Initialize learnable token embedding
-    learnable_concept_embedding = nn.Parameter(torch.zeros(text_encoder_1.config.hidden_size))
+    learnable_concept_embedding = torch.zeros(text_encoder_1.config.hidden_size)
     nn.init.normal_(learnable_concept_embedding, std=0.02)
     learnable_concept_embedding = learnable_concept_embedding.to(
         accelerator.device, dtype=weight_dtype
     )
+    learnable_concept_embedding = nn.Parameter(learnable_concept_embedding)
     learnable_concept_embedding.requires_grad_(True)
     
     if args.gradient_checkpointing:
@@ -887,6 +888,9 @@ def main():
 
     # Load vocabulary of concepts
     # get text embeddings for concepts in the vocabulary
+    text_encoder_1.to(accelerator.device, dtype=weight_dtype)
+    text_encoder_2.to(accelerator.device, dtype=weight_dtype)
+
     concept_vocab = get_vocabulary(args.concept_vocab_name, args.concept_vocab_size)
 
     concept_embeddings_path = (
@@ -901,6 +905,28 @@ def main():
     def get_concept_embeddings(tokenizer_1, tokenizer_2, text_encoder_1, text_encoder_2, vocab: list[str], device="cuda"):
         concepts = []
 
+        # Get empty prompt embeddings for text_encoder_2
+        with torch.no_grad():
+            input_ids_2 = tokenizer_2(
+                "",  # NOTE: we disable text_encoder_2
+                padding="max_length",
+                truncation=True,
+                max_length=tokenizer_2.model_max_length,
+                return_tensors="pt",
+            ).input_ids[0].unsqueeze(0)  # Add batch dimension
+            # print(input_ids_2.shape)
+            input_ids_2 = input_ids_2.to(device)
+
+            encoder_output_2 = text_encoder_2(
+                input_ids_2, output_hidden_states=True
+            )
+            encoder_hidden_states_2 = encoder_output_2.hidden_states[-2].to(
+                dtype=weight_dtype
+            )
+            # print(encoder_hidden_states_2.shape)
+            text_embeds = encoder_output_2[0]
+
+
         for concept in tqdm(vocab, desc="Getting concept embeddings", total=len(vocab)):
             with torch.no_grad():
                 input_ids_1 = tokenizer_1(
@@ -909,31 +935,20 @@ def main():
                     truncation=True,
                     max_length=tokenizer_1.model_max_length,
                     return_tensors="pt",
-                ).input_ids[0]
-                input_ids_2 = tokenizer_2(
-                    "",  # NOTE: we disable text_encoder_2
-                    padding="max_length",
-                    truncation=True,
-                    max_length=tokenizer_2.model_max_length,
-                    return_tensors="pt",
-                ).input_ids[0]
-
+                ).input_ids[0].unsqueeze(0)  # Add batch dimension
+                # print(input_ids_1.shape)
+                input_ids_1 = input_ids_1.to(device)
                 # Get the text embedding for conditioning
                 encoder_hidden_states_1 = (
                     text_encoder_1(input_ids_1, output_hidden_states=True)
                     .hidden_states[-2]
                     .to(dtype=weight_dtype)
                 )
-                encoder_output_2 = text_encoder_2(
-                    input_ids_2, output_hidden_states=True
-                )
-                encoder_hidden_states_2 = encoder_output_2.hidden_states[-2].to(
-                    dtype=weight_dtype
-                )
+                # print(encoder_hidden_states_1.shape)
+                
                 encoder_hidden_states = torch.cat(
                     [encoder_hidden_states_1, encoder_hidden_states_2], dim=-1
                 )
-                text_embeds = encoder_output_2[0]
                 concept_embedding = encoder_hidden_states.mean(dim=1)
 
             concepts.append(concept_embedding)
@@ -944,14 +959,14 @@ def main():
         return concepts
 
     if os.path.exists(concept_embeddings_path):
-        print(f"Loading concept embeddings from {concept_embeddings_path}")
+        accelerator.print(f"Loading concept embeddings from {concept_embeddings_path}")
         concept_embeddings = torch.load(concept_embeddings_path, map_location="cpu").to(accelerator.device)
     else:
         concept_embeddings = get_concept_embeddings(tokenizer_1, tokenizer_2, text_encoder_1, text_encoder_2, concept_vocab, device=accelerator.device)
         torch.save(concept_embeddings.cpu(), concept_embeddings_path)
-        print(f"Saved concept embeddings to {concept_embeddings_path}")
+        accelerator.print(f"Saved concept embeddings to {concept_embeddings_path}")
 
-    print(f"Concept embeddings shape: {concept_embeddings.shape}")
+    accelerator.print(f"Concept embeddings shape: {concept_embeddings.shape}")
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -996,7 +1011,7 @@ def main():
 
     optimizer = optimizer_class(
         # only optimize the embeddings
-        [learnable_concept_embedding.weight],
+        [learnable_concept_embedding],
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -1195,6 +1210,28 @@ def main():
         disable=not accelerator.is_local_main_process,
     )
 
+    # Get empty prompt embeddings for text_encoder_2
+    with torch.no_grad():
+        empty_prompt_input_ids_2 = tokenizer_2(
+            "",  # NOTE: we disable text_encoder_2
+            padding="max_length",
+            truncation=True,
+            max_length=tokenizer_2.model_max_length,
+            return_tensors="pt",
+        ).input_ids[0].unsqueeze(0)  # Add batch dimension
+        # print(empty_prompt_input_ids_2.shape)
+        empty_prompt_input_ids_2 = empty_prompt_input_ids_2.to(accelerator.device)
+
+        empty_prompt_encoder_output_2 = text_encoder_2(
+            empty_prompt_input_ids_2, output_hidden_states=True
+        )
+        empty_prompt_encoder_hidden_states_2 = empty_prompt_encoder_output_2.hidden_states[-2].to(
+            dtype=weight_dtype
+        )
+        # print(encoder_hidden_states_2.shape)
+        empty_prompt_text_embeds = empty_prompt_encoder_output_2[0]
+
+
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate([learnable_concept_embedding]):
@@ -1261,8 +1298,18 @@ def main():
                     [encoder_hidden_states_1, encoder_hidden_states_2], dim=-1
                 )
 
+                # print(encoder_hidden_states.shape)
+                # print(learnable_concept_embedding.shape)
+                # print(empty_prompt_encoder_hidden_states_2.shape)
                 # Add learnable token embedding to the encoded hidden states
-                encoder_hidden_states += learnable_concept_embedding
+                combined_learnable_concept_embedding = torch.cat(
+                    [
+                        learnable_concept_embedding.view(1, 1, -1).expand(*empty_prompt_encoder_hidden_states_2.shape[:2], -1),
+                        empty_prompt_encoder_hidden_states_2
+                    ], dim=-1
+                )
+                # print(combined_learnable_concept_embedding.shape)
+                encoder_hidden_states += combined_learnable_concept_embedding
 
                 # Predict the noise residual and cache intermediate activations
                 model_pred, acts_cache = run_with_cache(
@@ -1317,13 +1364,19 @@ def main():
 
                 # Compute the SAE activation loss
                 if args.sae_activation_loss == "l2":
-                    sae_loss = -torch.mean(sae_latent_acts**2) + torch.mean(
-                        other_features**2
+                    sae_loss_max = -torch.mean(
+                        sae_latent_acts**2
                     )
+                    sae_loss_min = torch.mean(other_features**2)
+                    sae_loss = sae_loss_max + sae_loss_min
                 elif args.sae_activation_loss == "l1":
-                    sae_loss = -torch.mean(sae_latent_acts.abs()) + torch.mean(
-                        other_features.abs()
+                    sae_loss_max = -torch.mean(
+                        torch.abs(sae_latent_acts)
                     )
+                    sae_loss_min = torch.mean(
+                        torch.abs(other_features)
+                    )
+                    sae_loss = sae_loss_max + sae_loss_min
                 else:
                     raise ValueError(
                         f"Unknown SAE activation loss {args.sae_activation_loss}"
@@ -1334,6 +1387,9 @@ def main():
                     + args.sae_activation_loss_weight * sae_loss
                 )
                 accelerator.backward(loss)
+
+                learnable_concept_embedding_grad_norm = learnable_concept_embedding.grad.norm(2).detach().item()
+                learnable_concept_embedding_norm = learnable_concept_embedding.norm(2).detach().item()
 
                 optimizer.step()
                 lr_scheduler.step()
@@ -1401,6 +1457,10 @@ def main():
             logs = {
                 "diffusion_loss": diffusion_loss.detach().item(),
                 "sae_loss": sae_loss.detach().item(),
+                "sae_loss_max": sae_loss_max.detach().item(),
+                "sae_loss_min": sae_loss_min.detach().item(),
+                "learnable_concept_embedding_grad_norm": learnable_concept_embedding_grad_norm,
+                "learnable_concept_embedding_norm": learnable_concept_embedding_norm,
                 "lr": lr_scheduler.get_last_lr()[0],
             }
             progress_bar.set_postfix(**logs)
