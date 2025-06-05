@@ -1,0 +1,1 @@
+srun -A plgzzsn2025-gpu-a100 -p plgrid-gpu-a100 -t 3:00:00 --gres gpu:1 --cpus-per-task=16 --mem-per-cpu=16GB --pty /bin/bash
