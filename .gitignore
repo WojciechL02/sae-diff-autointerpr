@@ -3,6 +3,8 @@ checkpoints/
 figures/
 logs/
 activations/
+wandb/
+sae_textual_inversion_sdxl/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
