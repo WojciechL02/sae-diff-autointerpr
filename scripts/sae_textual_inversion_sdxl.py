@@ -1371,6 +1371,7 @@ def main():
         .weight.data.clone()
     )
 
+    training_step = 0
     for epoch in range(first_epoch, args.num_train_epochs):
         text_encoder_1.train()
         text_encoder_2.train()
@@ -1515,10 +1516,19 @@ def main():
                 grad_norm2, embed_norm2 = get_embedding_info(
                     text_encoder_1, placeholder_token_ids
                 )
-                accelerator.log({"learned_embed_grad_norm1": grad_norm1})
-                accelerator.log({"learned_embed_norm1": embed_norm1})
-                accelerator.log({"learned_embed_grad_norm2": grad_norm2})
-                accelerator.log({"learned_embed_norm2": embed_norm2})
+                accelerator.log(
+                    {"learned_embed_grad_norm1": grad_norm1}, step=training_step
+                )
+                accelerator.log(
+                    {"learned_embed_norm1": embed_norm1}, step=training_step
+                )
+                accelerator.log(
+                    {"learned_embed_grad_norm2": grad_norm2}, step=training_step
+                )
+                accelerator.log(
+                    {"learned_embed_norm2": embed_norm2}, step=training_step
+                )
+                training_step += 1
                 #####################################
 
                 optimizer.step()
@@ -1642,7 +1652,7 @@ def main():
                 "lr": lr_scheduler.get_last_lr()[0],
             }
             progress_bar.set_postfix(**logs)
-            accelerator.log(logs, step=global_step)
+            accelerator.log(logs)
 
             if global_step >= args.max_train_steps:
                 break
