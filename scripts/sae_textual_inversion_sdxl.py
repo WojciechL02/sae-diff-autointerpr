@@ -211,6 +211,7 @@ def save_progress(
         .get_input_embeddings()
         .weight[min(placeholder_token_ids) : max(placeholder_token_ids) + 1]
     )
+
     learned_embeds_dict = {args.placeholder_token: learned_embeds.detach().cpu()}
 
     if tokenizer is not None:
@@ -910,6 +911,25 @@ def get_most_similar_tokens(learned_embeds, embeddings, tokenizer, k=8):
     return tokens, values
 
 
+def get_embedding_info(text_encoder, placeholder_token_ids):
+    learned_embed_grad_norm = (
+        text_encoder.text_model.embeddings.token_embedding.weight.grad.detach()[
+            min(placeholder_token_ids) : max(placeholder_token_ids) + 1
+        ]
+        .data.norm(2)
+        .item()
+    )
+    learned_embed_norm = (
+        text_encoder.text_model.embeddings.token_embedding.weight[
+            min(placeholder_token_ids) : max(placeholder_token_ids) + 1
+        ]
+        .detach()
+        .data.norm(2)
+        .item()
+    )
+    return learned_embed_grad_norm, learned_embed_norm
+
+
 def main():
     args = parse_args()
     if args.report_to == "wandb" and args.hub_token is not None:
@@ -1472,13 +1492,11 @@ def main():
 
                 # Compute the SAE activation loss
                 if args.sae_activation_loss == "l2":
-                    sae_loss = -torch.mean(sae_latent_acts**2) + torch.mean(
-                        other_features**2
-                    )
+                    sae_loss1 = -torch.mean(sae_latent_acts**2)
+                    sae_loss2 = torch.mean(other_features**2)
                 elif args.sae_activation_loss == "l1":
-                    sae_loss = -torch.mean(sae_latent_acts.abs()) + torch.mean(
-                        other_features.abs()
-                    )
+                    sae_loss1 = -torch.mean(sae_latent_acts.abs())
+                    sae_loss2 = torch.mean(other_features.abs())
                 else:
                     raise ValueError(
                         f"Unknown SAE activation loss {args.sae_activation_loss}"
@@ -1486,9 +1504,22 @@ def main():
 
                 loss = (
                     args.diffusion_loss_weight * diffusion_loss
-                    + args.sae_activation_loss_weight * sae_loss
+                    + args.sae_activation_loss_weight * (sae_loss1 + sae_loss2)
                 )
                 accelerator.backward(loss)
+
+                #### LOG LEARNED EMBEDDING INFO ####
+                grad_norm1, embed_norm1 = get_embedding_info(
+                    text_encoder_1, placeholder_token_ids
+                )
+                grad_norm2, embed_norm2 = get_embedding_info(
+                    text_encoder_1, placeholder_token_ids
+                )
+                accelerator.log({"learned_embed_grad_norm1": grad_norm1})
+                accelerator.log({"learned_embed_norm1": embed_norm1})
+                accelerator.log({"learned_embed_grad_norm2": grad_norm2})
+                accelerator.log({"learned_embed_norm2": embed_norm2})
+                #####################################
 
                 optimizer.step()
                 lr_scheduler.step()
@@ -1606,7 +1637,8 @@ def main():
 
             logs = {
                 "diffusion_loss": diffusion_loss.detach().item(),
-                "sae_loss": sae_loss.detach().item(),
+                "sae_loss1": sae_loss1.detach().item(),
+                "sae_loss2": sae_loss2.detach().item(),
                 "lr": lr_scheduler.get_last_lr()[0],
             }
             progress_bar.set_postfix(**logs)
