@@ -131,6 +131,7 @@ def log_validation(
     accelerator,
     weight_dtype,
     epoch,
+    is_initial_validation=False,
     is_final_validation=False,
 ):
     logger.info(
@@ -142,7 +143,9 @@ def log_validation(
     pipeline.scheduler = DPMSolverMultistepScheduler.from_config(
         pipeline.scheduler.config
     )  # NOTE: to avoid: `set_timesteps` does not support custom timestep schedules.
-    pipeline.text_encoder_2.text_projection.bias = learned_embed  # a bit hacky, but works
+    
+    if not is_initial_validation: # sanity check at the beginning
+        pipeline.text_encoder_2.text_projection.bias = learned_embed  # a bit hacky, but works
     pipeline = pipeline.to(accelerator.device)
 
     hooked_model = HookedDiffusionModel(
@@ -942,6 +945,7 @@ def main():
     concept_embeddings_path = (
         os.path.join(
             args.output_dir,
+            "..",
             f"{args.concept_vocab_name}_{args.concept_vocab_size if args.concept_vocab_size > 0 else 'all'}_concept_embeddings.pt",
         )
         if args.concept_embeddings_path is None
@@ -1220,6 +1224,29 @@ def main():
     else:
         initial_global_step = 0
 
+
+    if args.do_validation:
+        unet.to("cpu")
+        vae.to("cpu")
+        text_encoder_1.to("cpu")
+        text_encoder_2.to("cpu")
+        
+        images = log_validation(
+            learnable_concept_embedding,
+            sae,
+            train_dataset.image_captions,
+            args,
+            accelerator,
+            weight_dtype,
+            epoch=0,
+            is_initial_validation=True
+        )
+
+        unet.to(accelerator.device)
+        vae.to(accelerator.device)
+        text_encoder_1.to(accelerator.device)
+        text_encoder_2.to(accelerator.device)
+
     progress_bar = tqdm(
         range(0, args.max_train_steps),
         initial=initial_global_step,
@@ -1475,16 +1502,17 @@ def main():
                 is_final_validation=True,
             )
 
-        if args.save_full_model:
+        if args.save_as_full_pipeline:
             pipeline = DiffusionPipeline.from_pretrained(
                 args.pretrained_model_name_or_path,
-                text_encoder=accelerator.unwrap_model(text_encoder_1),
-                text_encoder_2=accelerator.unwrap_model(text_encoder_2),
+                text_encoder=text_encoder_1,
+                text_encoder_2=text_encoder_2,
                 vae=vae,
                 unet=unet,
                 tokenizer=tokenizer_1,
                 tokenizer_2=tokenizer_2,
             )
+            pipeline.text_encoder_2.text_projection.bias = learnable_concept_embedding
             pipeline.save_pretrained(args.output_dir)
         # Save the newly trained embeddings
         weight_name = "learned_embed.safetensors"
