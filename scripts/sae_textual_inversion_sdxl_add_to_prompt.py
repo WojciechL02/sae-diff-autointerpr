@@ -24,7 +24,9 @@ import shutil
 import sys
 from typing import Dict, List
 import json
+from pathlib import Path
 
+import matplotlib.pyplot as plt
 import diffusers
 import einops
 import numpy as np
@@ -58,6 +60,7 @@ from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokeniz
 sys.path.append(os.path.dirname(__file__))
 
 from src.hooked_model.utils import locate_block, retrieve
+from src.hooked_model.hooked_model_sdxl import HookedDiffusionModel
 from src.sae.sae import Sae
 from src.vocab import get_vocabulary
 
@@ -88,25 +91,42 @@ else:
 
 logger = get_logger(__name__)
 
-
 def get_most_similar_tokens(learned_embed, concept_embeddings, concept_vocab, k=8):
-    learned_embed = F.normalize(learned_embed, dim=1)
-    concept_embeddings = F.normalize(concept_embeddings, dim=1)
-    similarities = torch.matmul(concept_embeddings, learned_embed.T)
+    # learned_embed = F.normalize(learned_embed, dim=1)
+    # concept_embeddings = F.normalize(concept_embeddings, dim=1)
+    # similarities = torch.matmul(concept_embeddings, learned_embed.T)
+    similarities = F.cosine_similarity(
+        learned_embed.expand_as(concept_embeddings), concept_embeddings, dim=1
+    )
     values, indices = similarities.topk(k=k, dim=0)
-    # similarities = F.cosine_similarity(
-    #     learned_embed.expand_as(concept_embeddings), concept_embeddings, dim=1
-    # )
     concepts = [concept_vocab[i] for i in indices.squeeze().tolist()]
     return concepts, values
 
+def plot_sae_activations_distribution(avg_activations, latent_idx):
+    mask = np.zeros(len(avg_activations))
+    mask[latent_idx] = 30
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot(
+        np.arange(len(avg_activations)),
+        mask,
+        color="lightgray"
+    )
+    ax.plot(
+        np.arange(len(avg_activations)),
+        avg_activations,
+    )
+    ax.set_ylim(0, 30)
+    ax.set_ylabel("Activation Value")
+    ax.set_title(f"Feature={latent_idx}")
+    plt.tight_layout()
+
+    return fig, ax
+    
+
 def log_validation(
-    text_encoder_1,
-    text_encoder_2,
-    tokenizer_1,
-    tokenizer_2,
-    unet,
-    vae,
+    learned_embed,
+    sae,
+    captions,
     args,
     accelerator,
     weight_dtype,
@@ -114,42 +134,63 @@ def log_validation(
     is_final_validation=False,
 ):
     logger.info(
-        f"Running validation... \n Generating {args.num_validation_images} images."
+        f"Running validation... \n Generating {len(captions)} images."
     )
     pipeline = DiffusionPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
-        text_encoder=accelerator.unwrap_model(text_encoder_1),
-        text_encoder_2=accelerator.unwrap_model(text_encoder_2),
-        tokenizer=tokenizer_1,
-        tokenizer_2=tokenizer_2,
-        unet=unet,
-        vae=vae,
-        safety_checker=None,
-        revision=args.revision,
-        variant=args.variant,
-        torch_dtype=weight_dtype,
+        "stabilityai/sdxl-turbo", torch_dtype=weight_dtype, variant=args.variant
     )
     pipeline.scheduler = DPMSolverMultistepScheduler.from_config(
         pipeline.scheduler.config
-    )  # TODO: DDPMScheduler
+    )  # NOTE: to avoid: `set_timesteps` does not support custom timestep schedules.
+    pipeline.text_encoder_2.text_projection.bias = learned_embed  # a bit hacky, but works
     pipeline = pipeline.to(accelerator.device)
-    pipeline.set_progress_bar_config(disable=True)
+
+    hooked_model = HookedDiffusionModel(
+        model=pipeline.unet,
+        scheduler=pipeline.scheduler,
+        encode_prompt=pipeline.encode_prompt,
+        vae=pipeline.vae,
+    )
 
     # run inference
-    generator = (
-        None
-        if args.seed is None
-        else torch.Generator(device=accelerator.device).manual_seed(args.seed)
-    )
+
     images = []
-    for _ in range(args.num_validation_images):
-        validation_prompt = ""  # TODO: captions from coco
-        image = pipeline(
-            validation_prompt, num_inference_steps=25, generator=generator
-        ).images[
-            0
-        ]  # TODO: num_inference_steps
-        images.append(image)
+    avg_activations_per_sample = torch.zeros(
+        (len(captions), sae.num_latents), dtype=torch.float16
+    )
+    for i, prompt in enumerate(captions):
+        image, cache_dict = hooked_model.run_with_cache(
+            prompt=prompt,
+            num_images_per_prompt=1,
+            device=accelerator.device,
+            guidance_scale=7.5,
+            timesteps=[249],
+            height=args.resolution,
+            width=args.resolution,
+            generator=torch.Generator(device=accelerator.device).manual_seed(args.seed),
+            positions_to_cache=["down_blocks.2"],
+        )
+        acts = cache_dict["output"]["down_blocks.2"][:, -1]
+        acts = einops.rearrange(
+            acts,
+            "batch sample_size d_model -> (batch sample_size) d_model",
+        )
+        out = sae.pre_acts(acts)
+        # Reshape to get per-sample activations and compute mean for each sample
+        # print(out.shape)
+        out = out.view(
+            1, -1, sae.num_latents
+        )  # [1, sample_size, num_latents]
+        batch_avg_activations = out.mean(dim=1).to(
+            dtype=weight_dtype
+        )  # [1, num_latents]
+        avg_activations_per_sample[i] = batch_avg_activations.squeeze()
+        images.append(image[0])
+
+    avg_activations = avg_activations_per_sample.mean(dim=0)
+    sae_activations_dist_fig, _ = plot_sae_activations_distribution(
+        avg_activations.cpu().numpy(), args.sae_latent_idx
+    )
 
     tracker_key = "test" if is_final_validation else "validation"
     for tracker in accelerator.trackers:
@@ -160,11 +201,12 @@ def log_validation(
             tracker.log(
                 {
                     tracker_key: [
-                        wandb.Image(image, caption=f"{i}: {validation_prompt}")
-                        for i, image in enumerate(images)
-                    ]
+                        wandb.Image(image, caption=prompt)
+                        for image, prompt in zip(images, captions)
+                    ] + [wandb.Image(sae_activations_dist_fig, caption="SAE Activations Distribution")],
                 }
             )
+            
 
     del pipeline
     torch.cuda.empty_cache()
@@ -184,7 +226,6 @@ def save_progress(
     logger.info("Saving embeddings")
     learned_embed_dict = {"learned_embed": learned_embed.detach().cpu()}
 
-
     concepts, scores = get_most_similar_tokens(
         learned_embed.detach(), concept_embeddings.detach(), concept_vocab, k=8
     )
@@ -192,11 +233,10 @@ def save_progress(
     for con, score in zip(concepts, scores):
         table.add_data(con, score)
 
-    table = {f"top_concepts_table_{step}": table}
-    accelerator.log(table, step=step)
-    accelerator.log(
-        {"max_concept_cos_sim": scores[0]}
-    )
+    accelerator.log({
+        "max_concept_cos_sim": scores[0],
+        f"top_concepts_table_{step}": table
+    })
 
     if safe_serialization:
         safetensors.torch.save_file(
@@ -517,12 +557,6 @@ def parse_args():
         ), 
     )
     parser.add_argument(
-        "--num_validation_images",
-        type=int,
-        default=4,
-        help="Number of images that should be generated during validation.",
-    )
-    parser.add_argument(
         "--validation_steps",
         type=int,
         default=100,
@@ -626,6 +660,18 @@ def parse_args():
         type=float,
         default=1.0,
         help="Regulariazation strength for the SAE activation loss.",
+    )
+    parser.add_argument(
+        "--sae_loss_max_weight",
+        type=float,
+        default=1.0,
+        help="Regulariazation strength for sae_latent_idx activation loss.",
+    )
+    parser.add_argument(
+        "--sae_loss_min_weight",
+        type=float,
+        default=1.0,
+        help="Regulariazation strength the remaining SAE latents activation loss.",
     )
     parser.add_argument(
         "--diffusion_loss_weight",
@@ -754,7 +800,7 @@ class SAETextualInversionDataset(torch.utils.data.Dataset):
         ).input_ids[0]
 
         example["input_ids_2"] = self.tokenizer_2(
-            "",  # NOTE: we disable text_encoder_2
+            text,
             padding="max_length",
             truncation=True,
             max_length=self.tokenizer_2.model_max_length,
@@ -818,7 +864,7 @@ def main():
     # Handle the repository creation
     if accelerator.is_main_process:
         if args.output_dir is not None:
-            os.makedirs(args.output_dir, exist_ok=True)
+            Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
     # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
@@ -869,7 +915,7 @@ def main():
     )
 
     # Initialize learnable token embedding
-    learnable_concept_embedding = torch.zeros(text_encoder_1.config.hidden_size)
+    learnable_concept_embedding = torch.zeros(text_encoder_2.config.projection_dim)
     nn.init.normal_(learnable_concept_embedding, std=0.02)
     learnable_concept_embedding = learnable_concept_embedding.to(
         accelerator.device, dtype=weight_dtype
@@ -905,51 +951,23 @@ def main():
     def get_concept_embeddings(tokenizer_1, tokenizer_2, text_encoder_1, text_encoder_2, vocab: list[str], device="cuda"):
         concepts = []
 
-        # Get empty prompt embeddings for text_encoder_2
-        with torch.no_grad():
-            input_ids_2 = tokenizer_2(
-                "",  # NOTE: we disable text_encoder_2
-                padding="max_length",
-                truncation=True,
-                max_length=tokenizer_2.model_max_length,
-                return_tensors="pt",
-            ).input_ids[0].unsqueeze(0)  # Add batch dimension
-            # print(input_ids_2.shape)
-            input_ids_2 = input_ids_2.to(device)
-
-            encoder_output_2 = text_encoder_2(
-                input_ids_2, output_hidden_states=True
-            )
-            encoder_hidden_states_2 = encoder_output_2.hidden_states[-2].to(
-                dtype=weight_dtype
-            )
-            # print(encoder_hidden_states_2.shape)
-            text_embeds = encoder_output_2[0]
-
-
         for concept in tqdm(vocab, desc="Getting concept embeddings", total=len(vocab)):
             with torch.no_grad():
-                input_ids_1 = tokenizer_1(
+                input_ids_2 = tokenizer_2(
                     concept,
                     padding="max_length",
                     truncation=True,
-                    max_length=tokenizer_1.model_max_length,
+                    max_length=tokenizer_2.model_max_length,
                     return_tensors="pt",
                 ).input_ids[0].unsqueeze(0)  # Add batch dimension
-                # print(input_ids_1.shape)
-                input_ids_1 = input_ids_1.to(device)
-                # Get the text embedding for conditioning
-                encoder_hidden_states_1 = (
-                    text_encoder_1(input_ids_1, output_hidden_states=True)
-                    .hidden_states[-2]
-                    .to(dtype=weight_dtype)
+                # print(input_ids_2.shape)
+                input_ids_2 = input_ids_2.to(device)
+
+                encoder_output_2 = text_encoder_2(
+                    input_ids_2, output_hidden_states=True
                 )
-                # print(encoder_hidden_states_1.shape)
-                
-                encoder_hidden_states = torch.cat(
-                    [encoder_hidden_states_1, encoder_hidden_states_2], dim=-1
-                )
-                concept_embedding = encoder_hidden_states.mean(dim=1)
+                concept_embedding = encoder_output_2[0]
+                # print(concept_embedding.shape)
 
             concepts.append(concept_embedding)
 
@@ -1210,28 +1228,6 @@ def main():
         disable=not accelerator.is_local_main_process,
     )
 
-    # Get empty prompt embeddings for text_encoder_2
-    with torch.no_grad():
-        empty_prompt_input_ids_2 = tokenizer_2(
-            "",  # NOTE: we disable text_encoder_2
-            padding="max_length",
-            truncation=True,
-            max_length=tokenizer_2.model_max_length,
-            return_tensors="pt",
-        ).input_ids[0].unsqueeze(0)  # Add batch dimension
-        # print(empty_prompt_input_ids_2.shape)
-        empty_prompt_input_ids_2 = empty_prompt_input_ids_2.to(accelerator.device)
-
-        empty_prompt_encoder_output_2 = text_encoder_2(
-            empty_prompt_input_ids_2, output_hidden_states=True
-        )
-        empty_prompt_encoder_hidden_states_2 = empty_prompt_encoder_output_2.hidden_states[-2].to(
-            dtype=weight_dtype
-        )
-        # print(encoder_hidden_states_2.shape)
-        empty_prompt_text_embeds = empty_prompt_encoder_output_2[0]
-
-
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate([learnable_concept_embedding]):
@@ -1290,26 +1286,15 @@ def main():
                         for i in range(args.train_batch_size)
                     ]
                 ).to(accelerator.device, dtype=weight_dtype)
+                pooled_prompt_embed = encoder_output_2[0]
+                pooled_prompt_embed += learnable_concept_embedding.unsqueeze(0)
                 added_cond_kwargs = {
-                    "text_embeds": encoder_output_2[0],
+                    "text_embeds": pooled_prompt_embed,
                     "time_ids": add_time_ids,
                 }
                 encoder_hidden_states = torch.cat(
                     [encoder_hidden_states_1, encoder_hidden_states_2], dim=-1
                 )
-
-                # print(encoder_hidden_states.shape)
-                # print(learnable_concept_embedding.shape)
-                # print(empty_prompt_encoder_hidden_states_2.shape)
-                # Add learnable token embedding to the encoded hidden states
-                combined_learnable_concept_embedding = torch.cat(
-                    [
-                        learnable_concept_embedding.view(1, 1, -1).expand(*empty_prompt_encoder_hidden_states_2.shape[:2], -1),
-                        empty_prompt_encoder_hidden_states_2
-                    ], dim=-1
-                )
-                # print(combined_learnable_concept_embedding.shape)
-                encoder_hidden_states += combined_learnable_concept_embedding
 
                 # Predict the noise residual and cache intermediate activations
                 model_pred, acts_cache = run_with_cache(
@@ -1368,7 +1353,7 @@ def main():
                         sae_latent_acts**2
                     )
                     sae_loss_min = torch.mean(other_features**2)
-                    sae_loss = sae_loss_max + sae_loss_min
+                    sae_loss = args.sae_loss_max_weight * sae_loss_max + args.sae_loss_min_weight * sae_loss_min
                 elif args.sae_activation_loss == "l1":
                     sae_loss_max = -torch.mean(
                         torch.abs(sae_latent_acts)
@@ -1441,18 +1426,25 @@ def main():
                         logger.info(f"Saved state to {save_path}")
 
                     if args.do_validation and global_step % args.validation_steps == 0:
+                        unet.to("cpu")
+                        vae.to("cpu")
+                        text_encoder_1.to("cpu")
+                        text_encoder_2.to("cpu")
+                        
                         images = log_validation(
-                            text_encoder_1,
-                            text_encoder_2,
-                            tokenizer_1,
-                            tokenizer_2,
-                            unet,
-                            vae,
+                            learnable_concept_embedding,
+                            sae,
+                            train_dataset.image_captions,
                             args,
                             accelerator,
                             weight_dtype,
                             epoch,
                         )
+
+                        unet.to(accelerator.device)
+                        vae.to(accelerator.device)
+                        text_encoder_1.to(accelerator.device)
+                        text_encoder_2.to(accelerator.device)
 
             logs = {
                 "diffusion_loss": diffusion_loss.detach().item(),
@@ -1471,15 +1463,11 @@ def main():
     # Create the pipeline using the trained modules and save it.
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        # TODO: generate images with added learnable concept embedding
         if args.do_validation:
             images = log_validation(
-                text_encoder_1,
-                text_encoder_2,
-                tokenizer_1,
-                tokenizer_2,
-                unet,
-                vae,
+                learnable_concept_embedding,
+                sae,
+                train_dataset.image_captions,
                 args,
                 accelerator,
                 weight_dtype,
