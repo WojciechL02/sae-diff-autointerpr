@@ -140,12 +140,12 @@ def log_validation(
     pipeline = DiffusionPipeline.from_pretrained(
         "stabilityai/sdxl-turbo", torch_dtype=weight_dtype, variant=args.variant
     )
-    pipeline.scheduler = DPMSolverMultistepScheduler.from_config(
-        pipeline.scheduler.config
-    )  # NOTE: to avoid: `set_timesteps` does not support custom timestep schedules.
-    
-    if not is_initial_validation: # sanity check at the beginning
-        pipeline.text_encoder_2.text_projection.bias = learned_embed  # a bit hacky, but works
+    scheduler = DDPMScheduler.from_config(
+        pipeline.scheduler.config, timestep_spacing="trailing"
+    )
+    scheduler.set_timesteps(num_inference_steps=4)
+    accelerator.print(scheduler.timesteps)
+    pipeline.scheduler = scheduler
     pipeline = pipeline.to(accelerator.device)
 
     hooked_model = HookedDiffusionModel(
@@ -154,9 +154,7 @@ def log_validation(
         encode_prompt=pipeline.encode_prompt,
         vae=pipeline.vae,
     )
-
     # run inference
-
     images = []
     avg_activations_per_sample = torch.zeros(
         (len(captions), sae.num_latents), dtype=torch.float16
@@ -167,13 +165,17 @@ def log_validation(
             num_images_per_prompt=1,
             device=accelerator.device,
             guidance_scale=7.5,
-            timesteps=[249],
+            # timesteps=[249],
+            num_inference_steps=4,
             height=args.resolution,
             width=args.resolution,
             generator=torch.Generator(device=accelerator.device).manual_seed(args.seed),
-            positions_to_cache=["down_blocks.2"],
+            positions_to_cache=[args.sae_hookpoint],
+            sae_feature_embed=learned_embed if not is_initial_validation else None,
+            sae_target_timesteps=[args.timestep] if not is_initial_validation else [],
+            
         )
-        acts = cache_dict["output"]["down_blocks.2"][:, -1]
+        acts = cache_dict["output"][args.sae_hookpoint][:, -1]  # NOTE: only last timestep is used
         acts = einops.rearrange(
             acts,
             "batch sample_size d_model -> (batch sample_size) d_model",
@@ -1388,7 +1390,7 @@ def main():
                     sae_loss_min = torch.mean(
                         torch.abs(other_features)
                     )
-                    sae_loss = sae_loss_max + sae_loss_min
+                    sae_loss = args.sae_loss_max_weight * sae_loss_max + args.sae_loss_min_weight * sae_loss_min
                 else:
                     raise ValueError(
                         f"Unknown SAE activation loss {args.sae_activation_loss}"
@@ -1512,7 +1514,6 @@ def main():
                 tokenizer=tokenizer_1,
                 tokenizer_2=tokenizer_2,
             )
-            pipeline.text_encoder_2.text_projection.bias = learnable_concept_embedding
             pipeline.save_pretrained(args.output_dir)
         # Save the newly trained embeddings
         weight_name = "learned_embed.safetensors"

@@ -1,6 +1,7 @@
+learning_rate=$1
 sae_latent_idx=374
-learning_rate=10
 
+# --concept_embeddings_path /net/tscratch/people/plgpiorczynskim/sae-diff-autointerpr/sae_textual_inversion_sdxl_add_to_prompt_pooled/laion_bigrams_all_concept_embeddings.pt \
 
 
 sbatch slurm_scripts/submit_job.sh scripts/sae_textual_inversion_sdxl_add_to_prompt.py \
@@ -13,13 +14,12 @@ sbatch slurm_scripts/submit_job.sh scripts/sae_textual_inversion_sdxl_add_to_pro
     --timestep 249 \
     --coco_dataset_path /net/pr2/projects/plgrid/plggzzsn2025/coco \
     --resolution 1024 \
-    --concept_vocab_name laion_bigrams \
-    --concept_embeddings_path /net/tscratch/people/plgpiorczynskim/sae-diff-autointerpr/sae_textual_inversion_sdxl_add_to_prompt_pooled/laion_bigrams_all_concept_embeddings.pt \
+    --concept_vocab_name mscoco \
     --sae_activation_loss l1 \
     --sae_activation_loss_weight 1.0 \
     --sae_loss_max_weight 1.0 \
-    --sae_loss_min_weight 0.0 \
-    --diffusion_loss_weight 1.0 \
+    --sae_loss_min_weight 1.0 \
+    --diffusion_loss_weight 0.0 \
     --sae_max_feature_act 10 \
     --train_batch_size 1 \
     --gradient_accumulation_steps 4 \
@@ -30,6 +30,6 @@ sbatch slurm_scripts/submit_job.sh scripts/sae_textual_inversion_sdxl_add_to_pro
     --save_steps 200 \
     --do_validation \
     --validation_steps 200 \
-    --output_dir "sae_textual_inversion_sdxl_add_to_prompt_pooled/sae_latent_idx${sae_latent_idx}_${learning_rate}_max_only_diff_loss" \
+    --output_dir "sae_textual_inversion_sdxl_add_to_prompt_pooled_coco/sae_latent_idx${sae_latent_idx}_${learning_rate}" \
     --report_to wandb \
     --seed 42
