@@ -123,6 +123,8 @@ class HookedDiffusionModel:
         negative_pooled_prompt_embeds: Optional[torch.Tensor] = None,
         output_type: Optional[str] = "pil",
         device: torch.device = torch.device("cuda"),
+        sae_feature_embed: Optional[torch.Tensor] = None,
+        sae_target_timesteps: Optional[List[int]] = [],
         **kwargs,
     ):
         self.scheduler.num_inference_steps = num_inference_steps
@@ -173,6 +175,9 @@ class HookedDiffusionModel:
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
         add_text_embeds = pooled_prompt_embeds
+        if sae_feature_embed is not None:
+            sae_feature_embed = sae_feature_embed.unsqueeze(0)
+        
         text_encoder_projection_dim = 1280
         add_time_ids = self._get_add_time_ids(
             (height, width),
@@ -183,15 +188,24 @@ class HookedDiffusionModel:
         )
         negative_add_time_ids = add_time_ids
         if do_classifier_free_guidance:
+            # print(add_text_embeds.shape)
+            # print(negative_pooled_prompt_embeds.shape)
+
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
             add_text_embeds = torch.cat([negative_pooled_prompt_embeds, add_text_embeds], dim=0)
             add_time_ids = torch.cat([negative_add_time_ids, add_time_ids], dim=0)
+
+            if sae_feature_embed is not None:
+                # print(sae_feature_embed.shape)
+                sae_feature_embed = torch.cat([negative_pooled_prompt_embeds, sae_feature_embed], dim=0)
 
         prompt_embeds = prompt_embeds.to(device)
         add_text_embeds = add_text_embeds.to(device)
         add_time_ids = add_time_ids.to(device).repeat(
             batch_size * num_images_per_prompt, 1
         )
+        if sae_feature_embed is not None:
+            sae_feature_embed = sae_feature_embed.to(device)
 
         # Run denoising process
         latents = self._denoise_loop(
@@ -202,6 +216,8 @@ class HookedDiffusionModel:
             add_text_embeds,
             add_time_ids,
             extra_step_kwargs,
+            sae_feature_embed,
+            sae_target_timesteps,
         )
 
         # Convert latents to final image
@@ -404,6 +420,8 @@ class HookedDiffusionModel:
         add_text_embeds,
         add_time_ids,
         extra_step_kwargs,
+        sae_feature_embed,
+        sae_target_timesteps,
     ):
         timestep_cond = None
         for i, t in enumerate(timesteps):
@@ -417,6 +435,9 @@ class HookedDiffusionModel:
                 "time_ids": add_time_ids,
             }
 
+            if sae_feature_embed is not None and t in sae_target_timesteps:
+                added_cond_kwargs["text_embeds"] += sae_feature_embed
+            
             # Get model prediction
             noise_pred = self.model(
                 latent_model_input,

@@ -92,19 +92,16 @@ else:
 logger = get_logger(__name__)
 
 def get_most_similar_tokens(learned_embed, concept_embeddings, concept_vocab, k=8):
-    # learned_embed = F.normalize(learned_embed, dim=1)
-    # concept_embeddings = F.normalize(concept_embeddings, dim=1)
-    # similarities = torch.matmul(concept_embeddings, learned_embed.T)
-    similarities = F.cosine_similarity(
-        learned_embed.expand_as(concept_embeddings), concept_embeddings, dim=1
-    )
-    values, indices = similarities.topk(k=k, dim=0)
-    concepts = [concept_vocab[i] for i in indices.squeeze().tolist()]
-    return concepts, values
+    learned_embed = F.normalize(learned_embed, dim=1)
+    concept_embeddings = F.normalize(concept_embeddings, dim=1)
+    similarities = learned_embed @ concept_embeddings.T
+    top_values, top_indices = similarities.topk(k)
+    top_concepts = [concept_vocab[i] for i in top_indices.tolist()]
+    return top_concepts, top_values
 
 def plot_sae_activations_distribution(avg_activations, latent_idx):
     mask = np.zeros(len(avg_activations))
-    mask[latent_idx] = 30
+    mask[latent_idx] = 50
     fig, ax = plt.subplots(figsize=(12, 6))
     ax.plot(
         np.arange(len(avg_activations)),
@@ -115,7 +112,7 @@ def plot_sae_activations_distribution(avg_activations, latent_idx):
         np.arange(len(avg_activations)),
         avg_activations,
     )
-    ax.set_ylim(0, 30)
+    ax.set_ylim(0, 50)
     ax.set_ylabel("Activation Value")
     ax.set_title(f"Feature={latent_idx}")
     plt.tight_layout()
@@ -687,7 +684,7 @@ def parse_args():
     parser.add_argument(
         "--sae_max_feature_act",
         type=float,
-        required=True,
+        default=None,
         help="Maximal activation value that learned feature can have.",
     )
     parser.add_argument("--concept_vocab_name", type=str, default="laion", help="Vocabulary name")
@@ -921,7 +918,7 @@ def main():
 
     # Initialize learnable token embedding
     learnable_concept_embedding = torch.zeros(text_encoder_2.config.projection_dim)
-    nn.init.normal_(learnable_concept_embedding, std=0.02)
+    nn.init.normal_(learnable_concept_embedding, std=0.02)  # NOTE: for cosine similarity it doesn't matter
     learnable_concept_embedding = learnable_concept_embedding.to(
         accelerator.device, dtype=weight_dtype
     )
@@ -1366,6 +1363,7 @@ def main():
                 sae_latent_acts_org = (
                     active_positions_mask.unsqueeze(-1) * sae_latent_acts_org
                 )
+                # Clamp the activations to the max value
                 sae_latent_acts = torch.clamp(
                     sae_latent_acts_org[:, :, args.sae_latent_idx],
                     max=args.sae_max_feature_act,
