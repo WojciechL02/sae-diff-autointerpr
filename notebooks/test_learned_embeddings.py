@@ -29,8 +29,9 @@ def get_most_similar_tokens(learned_embeds, embeddings, tokenizer):
 
 # Path to your saved embeddings
 feature = 374
-step = 500
-embeddings_path1 = f"sae_textual_inversion_sdxl/sae_latent_idx{feature}/learned_embeds-steps-{step}.safetensors"
+step = 1000
+lr = 10.0
+embeddings_path1 = f"sae_textual_inversion_sdxl/sae_latent_idx{feature}_lr{lr}/learned_embeds-steps-{step}.safetensors"
 embeddings_path2 = f"sae_textual_inversion_sdxl/sae_latent_idx{feature}/learned_embeds_2-steps-{step}.safetensors"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
