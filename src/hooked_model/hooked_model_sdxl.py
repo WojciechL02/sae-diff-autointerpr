@@ -197,7 +197,8 @@ class HookedDiffusionModel:
 
             if sae_feature_embed is not None:
                 # print(sae_feature_embed.shape)
-                sae_feature_embed = torch.cat([negative_pooled_prompt_embeds, sae_feature_embed], dim=0)
+                # sae_feature_embed = torch.cat([negative_pooled_prompt_embeds, sae_feature_embed], dim=0)
+                sae_feature_embed = torch.cat([torch.zeros_like(negative_pooled_prompt_embeds), sae_feature_embed], dim=0)
 
         prompt_embeds = prompt_embeds.to(device)
         add_text_embeds = add_text_embeds.to(device)
