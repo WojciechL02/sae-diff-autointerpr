@@ -92,7 +92,7 @@ else:
 logger = get_logger(__name__)
 
 def get_most_similar_tokens(learned_embed, concept_embeddings, concept_vocab, k=8):
-    learned_embed = F.normalize(learned_embed, dim=1)
+    learned_embed = F.normalize(learned_embed, dim=0)
     concept_embeddings = F.normalize(concept_embeddings, dim=1)
     similarities = learned_embed @ concept_embeddings.T
     top_values, top_indices = similarities.topk(k)
@@ -1364,10 +1364,11 @@ def main():
                     active_positions_mask.unsqueeze(-1) * sae_latent_acts_org
                 )
                 # Clamp the activations to the max value
-                sae_latent_acts = torch.clamp(
-                    sae_latent_acts_org[:, :, args.sae_latent_idx],
-                    max=args.sae_max_feature_act,
-                )
+                if args.sae_max_feature_act is not None:
+                    sae_latent_acts = torch.clamp(
+                        sae_latent_acts_org[:, :, args.sae_latent_idx],
+                        max=args.sae_max_feature_act,
+                    )
 
                 other_features_indices = [
                     i for i in range(sae.num_latents) if i != args.sae_latent_idx
