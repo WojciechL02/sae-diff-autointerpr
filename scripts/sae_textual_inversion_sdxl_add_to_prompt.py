@@ -1483,6 +1483,7 @@ def main():
                         text_encoder_2.to(accelerator.device)
 
             logs = {
+                "loss": loss.detach().item(),
                 "diffusion_loss": diffusion_loss.detach().item(),
                 "sae_loss": sae_loss.detach().item(),
                 "sae_loss_max": sae_loss_max.detach().item(),
