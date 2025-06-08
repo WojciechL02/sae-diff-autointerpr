@@ -1362,38 +1362,39 @@ def main():
                     "batch_size sample_size d_model -> (batch_size sample_size) d_model",
                 )
                 sae_latent_acts = sae.pre_acts(acts)
-                sae_latent_acts_org = sae_latent_acts.view(bsz, -1, sae.num_latents)
+                sae_latent_acts = sae_latent_acts.view(bsz, -1, sae.num_latents)
 
-                # Mask out positions without concept
-                active_positions_mask = topk_active_positions_mask[batch["image_id"]]
-                sae_latent_acts_org = (
-                    active_positions_mask.unsqueeze(-1) * sae_latent_acts_org
-                )
-                # Clamp the activations to the max value
+                sae_latent_acts_max = sae_latent_acts[:, :, args.sae_latent_idx]
+
+                # Clamp the activations for maximization to the max value
                 if args.sae_max_feature_act is not None:
-                    sae_latent_acts = torch.clamp(
-                        sae_latent_acts_org[:, :, args.sae_latent_idx],
+                    sae_latent_acts_max = torch.clamp(
+                        sae_latent_acts_max,
                         max=args.sae_max_feature_act,
                     )
 
-                other_features_indices = [
+                # Mask out positions without concept
+                # NOTE: only for maximization
+                active_positions_mask = topk_active_positions_mask[batch["image_id"]].unsqueeze(-1)
+                
+                sae_latent_ids_min = [
                     i for i in range(sae.num_latents) if i != args.sae_latent_idx
                 ]
-                other_features = sae_latent_acts_org[:, :, other_features_indices]
+                sae_latent_acts_min = sae_latent_acts[:, :, sae_latent_ids_min]
 
                 # Compute the SAE activation loss
                 if args.sae_activation_loss == "l2":
                     sae_loss_max = -torch.mean(
-                        sae_latent_acts**2
+                        (sae_latent_acts_max * active_positions_mask)**2
                     )
-                    sae_loss_min = torch.mean(other_features**2)
+                    sae_loss_min = torch.mean(sae_latent_acts_min**2)
                     sae_loss = args.sae_loss_max_weight * sae_loss_max + args.sae_loss_min_weight * sae_loss_min
                 elif args.sae_activation_loss == "l1":
                     sae_loss_max = -torch.mean(
-                        torch.abs(sae_latent_acts)
+                        torch.abs(sae_latent_acts_max * active_positions_mask)
                     )
                     sae_loss_min = torch.mean(
-                        torch.abs(other_features)
+                        torch.abs(sae_latent_acts_min)
                     )
                     sae_loss = args.sae_loss_max_weight * sae_loss_max + args.sae_loss_min_weight * sae_loss_min
                 else:
