@@ -14,7 +14,7 @@ sbatch slurm_scripts/submit_job.sh scripts/sae_textual_inversion_sdxl_add_to_pro
     --coco_dataset_path /net/pr2/projects/plgrid/plggzzsn2025/coco \
     --resolution 1024 \
     --concept_vocab_name mscoco \
-    --concept_embeddings_path /net/tscratch/people/plgpiorczynskim/sae-diff-autointerpr/sae_textual_inversion_sdxl_add_to_prompt_pooled_coco/mscoco_all_concept_embeddings.pt \
+    --concept_embeddings_path /net/pr2/projects/plgrid/plggzzsn2025/sae-coco/mscoco_all_concept_embeddings.pt \
     --sae_activation_loss l2 \
     --sae_activation_loss_weight 1.0 \
     --sae_loss_max_weight 1.0 \
@@ -30,6 +30,6 @@ sbatch slurm_scripts/submit_job.sh scripts/sae_textual_inversion_sdxl_add_to_pro
     --save_steps 200 \
     --do_validation \
     --validation_steps 200 \
-    --output_dir "sae_textual_inversion_sdxl_add_to_prompt_pooled_coco/sae_latent_idx${sae_latent_idx}_${learning_rate}_l1" \
+    --output_dir "sae_textual_inversion_sdxl_add_to_prompt_pooled_coco/sae_latent_idx${sae_latent_idx}" \
     --report_to wandb \
     --seed 42
