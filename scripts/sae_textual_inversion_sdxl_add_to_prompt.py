@@ -144,6 +144,8 @@ def log_validation(
     pipeline.scheduler.set_timesteps(num_inference_steps=4)
     accelerator.print(pipeline.scheduler.timesteps)
 
+    pipeline = pipeline.to(accelerator.device)
+
     hooked_model = HookedDiffusionModel(
         model=pipeline.unet,
         scheduler=pipeline.scheduler,
