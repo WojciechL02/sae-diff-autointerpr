@@ -137,13 +137,8 @@ def log_validation(
     pipeline = DiffusionPipeline.from_pretrained(
         "stabilityai/sdxl-turbo", torch_dtype=weight_dtype, variant=args.variant
     )
-    scheduler = DDPMScheduler.from_config(
-        pipeline.scheduler.config, timestep_spacing="trailing"
-    )
-    scheduler.set_timesteps(num_inference_steps=4)
-    accelerator.print(scheduler.timesteps)
-    pipeline.scheduler = scheduler
-    pipeline = pipeline.to(accelerator.device)
+    pipeline.scheduler.set_timesteps(num_inference_steps=4)
+    accelerator.print(pipeline.scheduler.timesteps)
 
     hooked_model = HookedDiffusionModel(
         model=pipeline.unet,
@@ -161,7 +156,7 @@ def log_validation(
             prompt=prompt,
             num_images_per_prompt=1,
             device=accelerator.device,
-            guidance_scale=7.5,
+            guidance_scale=0.0,
             # timesteps=[249],
             num_inference_steps=4,
             height=args.resolution,
