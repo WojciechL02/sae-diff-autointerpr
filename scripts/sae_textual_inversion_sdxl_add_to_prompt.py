@@ -25,6 +25,7 @@ import sys
 from typing import Dict, List
 import json
 from pathlib import Path
+from datetime import datetime
 
 import matplotlib.pyplot as plt
 import diffusers
@@ -91,9 +92,12 @@ else:
 
 logger = get_logger(__name__)
 
-def get_most_similar_tokens(learned_embed, concept_embeddings, concept_vocab, k=8):
+def get_most_similar_tokens(learned_embed, concept_embeddings, concept_vocab, k=8, shifted=False):
     learned_embed = F.normalize(learned_embed, dim=0)
     concept_embeddings = F.normalize(concept_embeddings, dim=1)
+    if shifted:
+        learned_embed = learned_embed + concept_embeddings.mean(dim=0)
+        learned_embed = F.normalize(learned_embed, dim=0)
     similarities = learned_embed @ concept_embeddings.T
     top_values, top_indices = similarities.topk(k)
     top_concepts = [concept_vocab[i] for i in top_indices.tolist()]
@@ -233,6 +237,18 @@ def save_progress(
     accelerator.log({
         "max_concept_cos_sim": scores[0],
         f"top_concepts_table_{step}": table
+    })
+
+    concepts, scores = get_most_similar_tokens(
+        learned_embed.detach(), concept_embeddings.detach(), concept_vocab, k=8, shifted=True
+    )
+    table = wandb.Table(columns=["concept", "cosine_similarity"])
+    for con, score in zip(concepts, scores):
+        table.add_data(con, score)
+
+    accelerator.log({
+        "max_concept_cos_sim_shifted": scores[0],
+        f"top_concepts_table_{step}_shifted": table
     })
 
     if safe_serialization:
@@ -825,6 +841,7 @@ class SAETextualInversionDataset(torch.utils.data.Dataset):
 
 def main():
     args = parse_args()
+    args.output_dir = os.path.join(args.output_dir, datetime.now().strftime("%Y-%m-%d_%H:%M:%S"))
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
     accelerator_project_config = ProjectConfiguration(
         project_dir=args.output_dir, logging_dir=logging_dir
